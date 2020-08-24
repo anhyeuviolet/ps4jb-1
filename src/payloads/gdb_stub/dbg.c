@@ -5,8 +5,10 @@ extern int errno;
 #else
 #define _GNU_SOURCE
 #endif
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ucontext.h>
@@ -135,6 +137,14 @@ static const char* commands[] = {
     "g",
     "m",
     "qAttached",
+#ifdef __PS4__
+    "qOffsets",
+#endif
+    "qSupported:",
+#ifdef __PS4__
+    "qXfer:exec-file:read:",
+#endif
+    "qXfer:features:read:target.xml:",
     "s",
 };
 
@@ -147,6 +157,19 @@ static void reloc_commands()
     for(int i = 0; i < sizeof(commands) / sizeof(commands[0]); i++)
         commands[i] += diff;
 }
+
+#ifdef BLOB
+extern char _end[];
+
+static void mprotect_rwx()
+{
+    unsigned long long start = (unsigned long long)_start;
+    unsigned long long end = (unsigned long long)_end;
+    start &= ~(PAGE_SIZE-1);
+    end = ((end - 1) | (PAGE_SIZE-1)) + 1;
+    mprotect((void*)start, end-start, PROT_READ|PROT_WRITE|PROT_EXEC);
+}
+#endif
 #endif
 
 enum
@@ -163,6 +186,14 @@ enum
     CMD_G_READ,
     CMD_M_READ,
     CMD_Q_ATTACHED,
+#ifdef __PS4__
+    CMD_Q_OFFSETS,
+#endif
+    CMD_Q_SUPPORTED,
+#ifdef __PS4__
+    CMD_QXFER_EXEC_FILE,
+#endif
+    CMD_QXFER_TARGET_XML,
     CMD_S,
 };
 
@@ -291,6 +322,28 @@ static int write_mem(const unsigned char* buf, unsigned long long addr, int sz)
 
 static int was_last_step;
 
+void serve_string(pkt_opaque o, char* s, unsigned long long l, int has_annex)
+{
+    unsigned long long annex, start, len;
+    if(has_annex)
+        read_hex(o, &annex);
+    read_hex(o, &start);
+    read_hex(o, &len);
+    if(start > l)
+        start = l;
+    if(len > l || start + len > l)
+        len = l - start;
+    start_packet(o);
+    if(len == 0)
+        pkt_puts(o, "l", 1);
+    else
+    {
+        pkt_puts(o, "m", 1);
+        pkt_puts(o, s+start, len);
+    }
+    end_packet(o);
+}
+
 static void main_loop(struct trap_state* ts)
 {
     pkt_opaque o;
@@ -415,9 +468,37 @@ static void main_loop(struct trap_state* ts)
         case CMD_Q_ATTACHED:
             skip_to_end(o);
             start_packet(o);
-            pkt_puts(o, "1", 1);
+            pkt_puts(o, "0", 1);
             end_packet(o);
             break;
+#ifdef __PS4__
+#ifndef BLOB // TODO: implement (how?)
+        case CMD_QXFER_EXEC_FILE:
+            serve_string(o, "payload.elf", 11, 1);
+            break;
+#endif
+        case CMD_Q_OFFSETS:
+        {
+            skip_to_end(o);
+            start_packet(o);
+            unsigned long long base_addr = ((unsigned long long)_start);
+#ifdef BLOB
+            base_addr &= ~(PAGE_SIZE-1);
+            char probe;
+            while(!read_mem(&probe, base_addr, 1))
+                base_addr -= PAGE_SIZE;
+            base_addr += PAGE_SIZE;
+#else
+            base_addr -= PAGE_SIZE;
+#endif
+            char buf[24] = "TextSeg=";
+            for(int i = 15; i >= 0; i--)
+                buf[23-i] = int2hex((base_addr >> (4*i)) & 15);
+            pkt_puts(o, buf, 24);
+            end_packet(o);
+            break;
+        }
+#endif
         default:
             skip_to_end(o);
         case CMD_EOL:
@@ -560,6 +641,9 @@ static void tmp_sigsegv(int sig, siginfo_t* idc, void* o_uc)
 void dbg_enter(void)
 {
 #ifdef __PS4__
+#ifdef BLOB
+    mprotect_rwx();
+#endif
     reloc_commands();
 #endif
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -574,6 +658,8 @@ void dbg_enter(void)
         return;
     listen(sock, 1);
     gdb_socket = accept(sock, NULL, NULL);
+    int nodelay = 1;
+    setsockopt(gdb_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     int p[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, p);
     pipe_r = p[0];
@@ -599,6 +685,15 @@ void dbg_enter(void)
         case CMD_Q:
             skip_to_end(o);
             goto exit;
+        case CMD_Q_SUPPORTED:
+            skip_to_end(o);
+            start_packet(o);
+            pkt_puts(o, "qXfer:features:read+;qXfer:exec-file:read+", 42);
+            end_packet(o);
+            break;
+        case CMD_QXFER_TARGET_XML:
+            serve_string(o, "<?xml version=\"1.0\"?>\n<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n<target>\n<architecture>i386:x86-64</architecture>\n<osabi>GNU/Linux</osabi>\n</target>\n", 149, 0);
+            break;
         default:
             skip_to_end(o);
         case CMD_EOL:
